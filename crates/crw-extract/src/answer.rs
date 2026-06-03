@@ -54,14 +54,88 @@ const HEDGE_CLAUSE: &str =
 /// no-source cases and blew INCORRECT 2->17): here, no source still => abstain.
 const CALIBRATED_CLAUSE: &str = "- If the sources contain the answer — even stated indirectly, in different words, or requiring one obvious inference step (e.g. a year \"1933\" supports the decade \"the 1930s\") — give the direct answer confidently. Do NOT hedge, add disclaimers, or call the sources unclear when they in fact support an answer.\n- ONLY if the sources genuinely do not contain the information, say so plainly in one sentence. Never invent facts that are not in the sources.";
 
-/// Build the system prompt; `calibrated` swaps the abstention rule for the
-/// over-abstention-reducing variant (gated, default off).
-fn system_prompt(calibrated: bool) -> String {
-    if calibrated {
+/// The default output-format directive (line in SYSTEM_PROMPT). Swapped for
+/// `LIST_CLAUSE` when the list-format flag is on AND the query has list intent.
+const PROSE_CLAUSE: &str = "- Write a direct, neutral answer in 3–6 sentences of plain prose.";
+
+/// List-format output directive (gated). For "best/top X in Y" style queries,
+/// a ranked list of named options is the answer the user expects — not a
+/// paragraph. Keeps grounding + abstention intact: if the sources lack enough
+/// named options it falls back to a short direct answer rather than inventing.
+const LIST_CLAUSE: &str = "- The query asks for a ranked set of options, so format the answer as a ranked list (best first) of up to 10 NAMED entities drawn ONLY from the sources, one per line as `N. <name> — <one short clause on why, from the sources>`. Do not invent or pad entries. If the sources name fewer than two relevant options, give a direct neutral answer in 1–3 sentences instead of a list.";
+
+/// Build the system prompt. `calibrated` swaps the abstention rule for the
+/// over-abstention-reducing variant; `list_format` swaps the prose directive
+/// for the ranked-list directive. Both gated, default off.
+fn system_prompt(calibrated: bool, list_format: bool) -> String {
+    let mut s = if calibrated {
         SYSTEM_PROMPT.replace(HEDGE_CLAUSE, CALIBRATED_CLAUSE)
     } else {
         SYSTEM_PROMPT.to_string()
+    };
+    if list_format {
+        s = s.replace(PROSE_CLAUSE, LIST_CLAUSE);
     }
+    s
+}
+
+/// Deterministic, LLM-free classifier for "list intent": queries that ask for a
+/// ranked SET of named options ("best/top pizza in belgrade", "top 10 …",
+/// "recommend …", "list of …", "which … are the best"). Conservative by design
+/// — when in doubt it returns false so factual single-answer queries (the
+/// accuracy benchmark) keep the prose path. Used to gate [`LIST_CLAUSE`].
+pub fn is_list_intent(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+    // Tokenize on non-alphanumerics so "top-10" / "best:" still match.
+    let toks: Vec<&str> = q
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if toks.is_empty() {
+        return false;
+    }
+
+    // Explicit list phrases anywhere in the query.
+    const LIST_PHRASES: &[&str] = &[
+        "list of", "top 10", "top ten", "top 5", "top five", "top 20",
+    ];
+    if LIST_PHRASES.iter().any(|p| q.contains(p)) {
+        return true;
+    }
+
+    // Superlative/recommendation cue in the FIRST two tokens — "best pizza …",
+    // "top restaurants …", "cheapest flights …", "recommend a …". Anchored to
+    // the head so a mid-sentence "best" in a factual question doesn't fire.
+    const HEAD_CUES: &[&str] = &[
+        "best",
+        "top",
+        "cheapest",
+        "fastest",
+        "greatest",
+        "finest",
+        "recommend",
+        "recommended",
+        "recommendations",
+    ];
+    let head_has_cue = toks.iter().take(2).any(|t| HEAD_CUES.contains(t));
+    if !head_has_cue {
+        return false;
+    }
+    // A bare superlative factual question ("best time to visit …", "what is the
+    // best way to …") is NOT a list — require the head cue to be paired with a
+    // location/category framing ("… in <place>", "… for <category>", or a
+    // plural-ish noun). The cheap, robust signal is the presence of "in"/"for"/
+    // "near" later in the query, which is what "best X in Y" queries carry.
+    const FRAME_WORDS: &[&str] = &["in", "for", "near", "around"];
+    // Exclude clearly-singular factual framings that share the head cue.
+    const SINGULAR_TRAPS: &[&str] = &["time", "way", "place", "method", "approach"];
+    if toks.iter().take(3).any(|t| SINGULAR_TRAPS.contains(t)) {
+        return false;
+    }
+    toks.iter().any(|t| FRAME_WORDS.contains(t))
 }
 
 pub struct AnswerResult {
@@ -105,6 +179,7 @@ pub async fn synthesize(
     max_chars_per_source: usize,
     user_prompt: Option<&str>,
     calibrated: bool,
+    list_format: bool,
 ) -> CrwResult<AnswerResult> {
     if sources.is_empty() {
         return Err(CrwError::InvalidRequest(
@@ -137,7 +212,7 @@ pub async fn synthesize(
     // non-trivial; the current shape — model emits a `===CITATIONS===`
     // line followed by JSON — gives us structured output with a single
     // provider-agnostic call. Fabricated source_ids are rejected below.
-    let sys = system_prompt(calibrated);
+    let sys = system_prompt(calibrated, list_format);
     let mut augmented_prompt = format!(
         "{sys}\n\nINSTEAD of calling a tool, append the citations after \
          your answer in this exact format:\n\n===CITATIONS===\n[{{\"source_id\": 0, \
@@ -295,6 +370,7 @@ pub async fn synthesize_selected(
     max_chars_per_source: usize,
     user_prompt: Option<&str>,
     calibrated: bool,
+    list_format: bool,
 ) -> CrwResult<AnswerResult> {
     let reduce_futs = sources.iter().map(|(url, title, md)| async move {
         let new_md = if md.len() >= PASSAGE_SELECT_MIN_CHARS {
@@ -314,6 +390,7 @@ pub async fn synthesize_selected(
         max_chars_per_source,
         user_prompt,
         calibrated,
+        list_format,
     )
     .await
 }
@@ -453,5 +530,51 @@ mod tests {
         let (_, cites, warns) = parse_answer_and_citations(raw, &sources);
         assert!(cites.is_empty());
         assert!(warns.iter().any(|w| w.contains("failed to parse")));
+    }
+
+    #[test]
+    fn list_intent_fires_on_best_x_in_y() {
+        // The reported query and its kin — ranked-set asks.
+        assert!(is_list_intent("best pizza in the belgrade"));
+        assert!(is_list_intent("best restaurants in belgrade"));
+        assert!(is_list_intent("top coffee shops in tokyo"));
+        assert!(is_list_intent("cheapest flights for paris"));
+        assert!(is_list_intent("top 10 movies of 2026"));
+        assert!(is_list_intent("recommend hotels in vienna"));
+        assert!(is_list_intent("list of pizzerias near belgrade"));
+    }
+
+    #[test]
+    fn list_intent_skips_factual_questions() {
+        // Single-answer / factual queries must keep the prose path so the
+        // accuracy benchmark is untouched.
+        assert!(!is_list_intent("who painted the mona lisa"));
+        assert!(!is_list_intent("when did the berlin wall fall"));
+        assert!(!is_list_intent("what is the capital of serbia"));
+        assert!(!is_list_intent("population of belgrade"));
+        // Superlative but singular/factual framings (the traps).
+        assert!(!is_list_intent("best time to visit belgrade"));
+        assert!(!is_list_intent("best way to learn rust"));
+        assert!(!is_list_intent(""));
+    }
+
+    #[test]
+    fn system_prompt_swaps_prose_for_list_only_when_enabled() {
+        // The exact prose directive must exist in the base prompt (guards the
+        // swap target against drift).
+        assert!(SYSTEM_PROMPT.contains(PROSE_CLAUSE));
+
+        let prose = system_prompt(false, false);
+        assert!(prose.contains(PROSE_CLAUSE));
+        assert!(!prose.contains("ranked list"));
+
+        let list = system_prompt(false, true);
+        assert!(!list.contains(PROSE_CLAUSE));
+        assert!(list.contains("ranked list"));
+
+        // List swap composes with the calibrated abstention swap.
+        let both = system_prompt(true, true);
+        assert!(both.contains("ranked list"));
+        assert!(both.contains("give the direct answer confidently"));
     }
 }
